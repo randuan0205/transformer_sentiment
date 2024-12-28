@@ -10,6 +10,7 @@ Using the powerful transformer model to implement sentiment analysis upon IMDB m
 
 ## The final model performance measurement:
 Based on some quick and simple model training (roughly 200 epochs), the model achived AUC 0.94 and accuracy of 86%, indicating the outstanding prediction power of transformer model
+![Model Performance](./images/roccurve.png)
 
 ## The project codes 1 (transformer modules):
 Build standard code modules to implement transformer model efficiently. There are two modules, transformer and stepbystep, under the transformer_modules directory. The first one is a modulized implementation of transformer model, and the second one is for implementing various functions such as train, dataloader, predict etc.
