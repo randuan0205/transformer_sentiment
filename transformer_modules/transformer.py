@@ -28,6 +28,33 @@ class PositionalEncoding(nn.Module):
         scaled_x = x * np.sqrt(self.d_model)
         encoded = scaled_x + self.pe[:, :x.size(1), :]
         return encoded
+
+# class EncoderPe(nn.Module):
+#     def __init__(self, n_heads, d_model, ff_units, n_features=None, max_len=100):
+#         super().__init__()
+#         pe_dim = d_model if n_features is None else n_features
+#         self.pe = PositionalEncoding(max_len, pe_dim)
+#         self.layer = EncoderSelfAttn(n_heads, d_model, ff_units, n_features)
+    
+#     def forward(self, query, mask=None):
+#         query_pe = self.pe(query)
+#         out = self.layer(query_pe, mask)
+#         return out
+    
+# class DecoderPe(nn.Module):
+#     def __init__(self, n_heads, d_model, ff_units, n_features=None, max_len=100):
+#         super().__init__()
+#         pe_dim = d_model if n_features is None else n_features
+#         self.pe = PositionalEncoding(max_len, pe_dim)
+#         self.layer = DecoderSelfAttn(n_heads, d_model, ff_units, n_features)
+        
+#     def init_keys(self, states):
+#         self.layer.init_keys(states)
+    
+#     def forward(self, query, source_mask=None, target_mask=None):
+#         query_pe = self.pe(query)
+#         out = self.layer(query_pe, source_mask, target_mask)
+#         return out
     
 class MultiHeadedAttention(nn.Module):
     def __init__(self, n_heads, d_model, dropout=0.1):
@@ -209,119 +236,358 @@ class DecoderTransf(nn.Module):
             x = layer(x, source_mask, target_mask)
         # Norm
         return self.norm(x)
-    
-class TransformerModel(nn.Module):
-    def __init__(self, transformer, input_len, target_len, n_features):
-        super().__init__()
-        self.transf = transformer
+
+class EncoderDecoderTransf(nn.Module):
+    def __init__(self, encoder, decoder, input_len, target_len, n_features):
+        super(EncoderDecoderTransf, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
         self.input_len = input_len
         self.target_len = target_len
-        self.trg_masks = self.transf.generate_square_subsequent_mask(self.target_len)
+        self.trg_masks = self.subsequent_mask(self.target_len)
+
         self.n_features = n_features
-        self.proj = nn.Linear(n_features, self.transf.d_model)
-        self.linear = nn.Linear(self.transf.d_model, n_features)
-        
-        max_len = max(self.input_len, self.target_len)
-        self.pe = PositionalEncoding(max_len, self.transf.d_model)
-        self.norm = nn.LayerNorm(self.transf.d_model)
-                
-    def preprocess(self, seq):
-        seq_proj = self.proj(seq)
-        seq_enc = self.pe(seq_proj)
-        return self.norm(seq_enc)
-    
-    def encode_decode(self, source, target, source_mask=None, target_mask=None):
-        # Projections
-        # PyTorch Transformer expects L, N, F
-        src = self.preprocess(source).permute(1, 0, 2)
-        tgt = self.preprocess(target).permute(1, 0, 2)
+        self.proj = nn.Linear(n_features, encoder.d_model)
+        self.linear = nn.Linear(encoder.d_model, n_features)
 
-        out = self.transf(src, tgt, 
-                          src_key_padding_mask=source_mask, 
-                          tgt_mask=target_mask)
+    @staticmethod
+    def subsequent_mask(size):
+        attn_shape = (1, size, size)
+        subsequent_mask = (1 - torch.triu(torch.ones(attn_shape), diagonal=1))
+        return subsequent_mask
 
+    def encode(self, source_seq, source_mask=None):
+        # Projection
+        source_proj = self.proj(source_seq)
+        encoder_states = self.encoder(source_proj, source_mask)
+        self.decoder.init_keys(encoder_states)
+
+    def decode(self, shifted_target_seq, source_mask=None, target_mask=None):
+        # Projection
+        target_proj = self.proj(shifted_target_seq)
+        outputs = self.decoder(target_proj,
+                               source_mask=source_mask,
+                               target_mask=target_mask)
         # Linear
-        # Back to N, L, D
-        out = out.permute(1, 0, 2)
-        out = self.linear(out) # N, L, F
-        return out
-        
-    def predict(self, source_seq, source_mask=None):
+        outputs = self.linear(outputs)
+        return outputs
+
+    def predict(self, source_seq, source_mask):
         inputs = source_seq[:, -1:]
         for i in range(self.target_len):
-            out = self.encode_decode(source_seq, inputs, 
-                                     source_mask=source_mask,
-                                     target_mask=self.trg_masks[:i+1, :i+1])
+            out = self.decode(inputs, source_mask, self.trg_masks[:, :i+1, :i+1])
             out = torch.cat([inputs, out[:, -1:, :]], dim=-2)
             inputs = out.detach()
-        outputs = out[:, 1:, :]
+        outputs = inputs[:, 1:, :]
         return outputs
-        
+
     def forward(self, X, source_mask=None):
-        self.trg_masks = self.trg_masks.type_as(X)
+        self.trg_masks = self.trg_masks.type_as(X).bool()
         source_seq = X[:, :self.input_len, :]
-        
-        if self.training:            
+
+        self.encode(source_seq, source_mask)
+        if self.training:
             shifted_target_seq = X[:, self.input_len-1:-1, :]
-            outputs = self.encode_decode(source_seq, shifted_target_seq, 
-                                         source_mask=source_mask, 
-                                         target_mask=self.trg_masks)
+            outputs = self.decode(shifted_target_seq, source_mask, self.trg_masks)
         else:
             outputs = self.predict(source_seq, source_mask)
-            
+
         return outputs
     
-# Adapted from https://amaarora.github.io/2021/01/18/ViT.html
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, dilation=1):
-        super().__init__()        
-        num_patches = (img_size // patch_size) * (img_size // patch_size)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x):
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        return x
-    
-class ViT(nn.Module):
-    def __init__(self, encoder, img_size, in_channels, patch_size, n_outputs):
-        super().__init__()
-        self.d_model = encoder.d_model
-        self.n_outputs = n_outputs
-        self.encoder = encoder
-        self.mlp = nn.Linear(encoder.d_model, n_outputs)
-
-        self.embed = PatchEmbed(img_size, patch_size, in_channels, encoder.d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder.d_model))
+# class EncoderDecoderSelfAttn(nn.Module):
+#     def __init__(self, encoder, decoder, input_len, target_len):
+#         super().__init__()
+#         self.encoder = encoder
+#         self.decoder = decoder
+#         self.input_len = input_len
+#         self.target_len = target_len
+#         self.trg_masks = self.subsequent_mask(self.target_len)
         
-    def preprocess(self, X):
-        # Patch embeddings
-        # N, L, F -> N, L, D
-        src = self.embed(X)
-        # Special classifier token
-        # 1, 1, D -> N, 1, D
-        cls_tokens = self.cls_token.expand(X.size(0), -1, -1)
-        # Concatenates CLS tokens -> N, 1 + L, D
-        src = torch.cat((cls_tokens, src), dim=1)
-        return src
-    
-    def encode(self, source):
-        # Encoder generates "hidden states"
-        states = self.encoder(source)
-        # Gets state from first token: CLS
-        cls_state = states[:, 0]  # N, 1, D
-        return cls_state
+#     @staticmethod
+#     def subsequent_mask(size):
+#         attn_shape = (1, size, size)
+#         subsequent_mask = (1 - torch.triu(torch.ones(attn_shape), diagonal=1))
+#         return subsequent_mask
+                
+#     def encode(self, source_seq, source_mask):
+#         # Encodes the source sequence and uses the result
+#         # to initialize the decoder
+#         encoder_states = self.encoder(source_seq, source_mask)
+#         self.decoder.init_keys(encoder_states)
         
-    def forward(self, X):
-        src = self.preprocess(X)
-        # Featurizer
-        cls_state = self.encode(src)
-        # Classifier
-        out = self.mlp(cls_state) # N, 1, outputs
-        return out
+#     def decode(self, shifted_target_seq, source_mask=None, target_mask=None):
+#         # Decodes/generates a sequence using the shifted (masked)
+#         # target sequence - used in TRAIN mode
+#         outputs = self.decoder(shifted_target_seq, 
+#                                source_mask=source_mask,
+#                                target_mask=target_mask)
+#         return outputs
     
+#     def predict(self, source_seq, source_mask):
+#         # Decodes/generates a sequence using one input
+#         # at a time - used in EVAL mode
+#         inputs = source_seq[:, -1:]
+#         for i in range(self.target_len):
+#             out = self.decode(inputs, source_mask, self.trg_masks[:, :i+1, :i+1])
+#             out = torch.cat([inputs, out[:, -1:, :]], dim=-2)
+#             inputs = out.detach()
+#         outputs = inputs[:, 1:, :]
+#         return outputs
+                
+#     def forward(self, X, source_mask=None):
+#         # Sends the mask to the same device as the inputs
+#         self.trg_masks = self.trg_masks.type_as(X).bool()
+#         # Slices the input to get source sequence
+#         source_seq = X[:, :self.input_len, :]
+#         # Encodes source sequence AND initializes decoder
+#         self.encode(source_seq, source_mask)
+#         if self.training:
+#             # Slices the input to get the shifted target seq
+#             shifted_target_seq = X[:, self.input_len-1:-1, :]
+#             # Decodes using the mask to prevent cheating
+#             outputs = self.decode(shifted_target_seq, source_mask, self.trg_masks)
+#         else:
+#             # Decodes using its own predictions
+#             outputs = self.predict(source_seq, source_mask)
+            
+#         return outputs
+
+# class EncoderDecoderTransf(EncoderDecoderSelfAttn):
+#     def __init__(self, encoder, decoder, input_len, target_len, n_features):
+#         super(EncoderDecoderTransf, self).__init__(encoder, decoder, input_len, target_len)
+#         self.n_features = n_features
+#         self.proj = nn.Linear(n_features, encoder.d_model)
+#         self.linear = nn.Linear(encoder.d_model, n_features)
+            
+#     def encode(self, source_seq, source_mask=None):
+#         # Projection
+#         source_proj = self.proj(source_seq)
+#         encoder_states = self.encoder(source_proj, source_mask)
+#         self.decoder.init_keys(encoder_states)    
+        
+#     def decode(self, shifted_target_seq, source_mask=None, target_mask=None):
+#         # Projection
+#         target_proj = self.proj(shifted_target_seq)
+#         outputs = self.decoder(target_proj,
+#                                source_mask=source_mask,
+#                                target_mask=target_mask)
+#         # Linear
+#         outputs = self.linear(outputs)
+#         return outputs
+    
+#######################################################Unused code below#########################################################
+# This module is designed for pytorch transformer
+# class TransformerModel(nn.Module):
+#     def __init__(self, transformer, input_len, target_len, n_features):
+#         super().__init__()
+#         self.transf = transformer
+#         self.input_len = input_len
+#         self.target_len = target_len
+#         self.trg_masks = self.transf.generate_square_subsequent_mask(self.target_len)
+#         self.n_features = n_features
+#         self.proj = nn.Linear(n_features, self.transf.d_model)
+#         self.linear = nn.Linear(self.transf.d_model, n_features)
+        
+#         max_len = max(self.input_len, self.target_len)
+#         self.pe = PositionalEncoding(max_len, self.transf.d_model)
+#         self.norm = nn.LayerNorm(self.transf.d_model)
+                
+#     def preprocess(self, seq):
+#         seq_proj = self.proj(seq)
+#         seq_enc = self.pe(seq_proj)
+#         return self.norm(seq_enc)
+    
+#     def encode_decode(self, source, target, source_mask=None, target_mask=None):
+#         # Projections
+#         # PyTorch Transformer expects L, N, F
+#         src = self.preprocess(source).permute(1, 0, 2)
+#         tgt = self.preprocess(target).permute(1, 0, 2)
+
+#         out = self.transf(src, tgt, 
+#                           src_key_padding_mask=source_mask, 
+#                           tgt_mask=target_mask)
+
+#         # Linear
+#         # Back to N, L, D
+#         out = out.permute(1, 0, 2)
+#         out = self.linear(out) # N, L, F
+#         return out
+        
+#     def predict(self, source_seq, source_mask=None):
+#         inputs = source_seq[:, -1:]
+#         for i in range(self.target_len):
+#             out = self.encode_decode(source_seq, inputs, 
+#                                      source_mask=source_mask,
+#                                      target_mask=self.trg_masks[:i+1, :i+1])
+#             out = torch.cat([inputs, out[:, -1:, :]], dim=-2)
+#             inputs = out.detach()
+#         outputs = out[:, 1:, :]
+#         return outputs
+        
+#     def forward(self, X, source_mask=None):
+#         self.trg_masks = self.trg_masks.type_as(X)
+#         source_seq = X[:, :self.input_len, :]
+        
+#         if self.training:            
+#             shifted_target_seq = X[:, self.input_len-1:-1, :]
+#             outputs = self.encode_decode(source_seq, shifted_target_seq, 
+#                                          source_mask=source_mask, 
+#                                          target_mask=self.trg_masks)
+#         else:
+#             outputs = self.predict(source_seq, source_mask)
+            
+#         return outputs
+    
+# # Adapted from https://amaarora.github.io/2021/01/18/ViT.html
+# class PatchEmbed(nn.Module):
+#     def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, dilation=1):
+#         super().__init__()        
+#         num_patches = (img_size // patch_size) * (img_size // patch_size)
+#         self.img_size = img_size
+#         self.patch_size = patch_size
+#         self.num_patches = num_patches
+#         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+#     def forward(self, x):
+#         x = self.proj(x).flatten(2).transpose(1, 2)
+#         return x
+    
+# class ViT(nn.Module):
+#     def __init__(self, encoder, img_size, in_channels, patch_size, n_outputs):
+#         super().__init__()
+#         self.d_model = encoder.d_model
+#         self.n_outputs = n_outputs
+#         self.encoder = encoder
+#         self.mlp = nn.Linear(encoder.d_model, n_outputs)
+
+#         self.embed = PatchEmbed(img_size, patch_size, in_channels, encoder.d_model)
+#         self.cls_token = nn.Parameter(torch.zeros(1, 1, encoder.d_model))
+        
+#     def preprocess(self, X):
+#         # Patch embeddings
+#         # N, L, F -> N, L, D
+#         src = self.embed(X)
+#         # Special classifier token
+#         # 1, 1, D -> N, 1, D
+#         cls_tokens = self.cls_token.expand(X.size(0), -1, -1)
+#         # Concatenates CLS tokens -> N, 1 + L, D
+#         src = torch.cat((cls_tokens, src), dim=1)
+#         return src
+    
+#     def encode(self, source):
+#         # Encoder generates "hidden states"
+#         states = self.encoder(source)
+#         # Gets state from first token: CLS
+#         cls_state = states[:, 0]  # N, 1, D
+#         return cls_state
+        
+#     def forward(self, X):
+#         src = self.preprocess(X)
+#         # Featurizer
+#         cls_state = self.encode(src)
+#         # Classifier
+#         out = self.mlp(cls_state) # N, 1, outputs
+#         return out
+    
+# class Encoder(nn.Module):
+#     def __init__(self, n_features, hidden_dim):
+#         super().__init__()
+#         self.hidden_dim = hidden_dim
+#         self.n_features = n_features
+#         self.hidden = None
+#         self.basic_rnn = nn.GRU(self.n_features, self.hidden_dim, batch_first=True)
+                
+#     def forward(self, X):        
+#         rnn_out, self.hidden = self.basic_rnn(X)
+        
+#         return rnn_out # N, L, F
+
+# class Decoder(nn.Module):
+#     def __init__(self, n_features, hidden_dim):
+#         super().__init__()
+#         self.hidden_dim = hidden_dim
+#         self.n_features = n_features
+#         self.hidden = None
+#         self.basic_rnn = nn.GRU(self.n_features, self.hidden_dim, batch_first=True) 
+#         self.regression = nn.Linear(self.hidden_dim, self.n_features)
+        
+#     def init_hidden(self, hidden_seq):
+#         # We only need the final hidden state
+#         hidden_final = hidden_seq[:, -1:] # N, 1, H
+#         # But we need to make it sequence-first
+#         self.hidden = hidden_final.permute(1, 0, 2) # 1, N, H                      
+        
+#     def forward(self, X):
+#         # X is N, 1, F
+#         batch_first_output, self.hidden = self.basic_rnn(X, self.hidden) 
+        
+#         last_output = batch_first_output[:, -1:]
+#         out = self.regression(last_output)
+        
+#         # N, 1, F
+#         return out.view(-1, 1, self.n_features)
+
+# class EncoderDecoder(nn.Module):
+#     def __init__(self, encoder, decoder, input_len, target_len, teacher_forcing_prob=0.5):
+#         super().__init__()
+#         self.encoder = encoder
+#         self.decoder = decoder
+#         self.input_len = input_len
+#         self.target_len = target_len
+#         self.teacher_forcing_prob = teacher_forcing_prob
+#         self.outputs = None
+        
+#     def init_outputs(self, batch_size):
+#         device = next(self.parameters()).device
+#         # N, L (target), F
+#         self.outputs = torch.zeros(batch_size, 
+#                               self.target_len, 
+#                               self.encoder.n_features).to(device)
+    
+#     def store_output(self, i, out):
+#         # Stores the output
+#         self.outputs[:, i:i+1, :] = out
+        
+#     def forward(self, X):               
+#         # splits the data in source and target sequences
+#         # the target seq will be empty in testing mode
+#         # N, L, F
+#         source_seq = X[:, :self.input_len, :]
+#         target_seq = X[:, self.input_len:, :]
+#         self.init_outputs(X.shape[0])        
+        
+#         # Encoder expected N, L, F
+#         hidden_seq = self.encoder(source_seq)
+#         # Output is N, L, H
+#         self.decoder.init_hidden(hidden_seq)
+        
+#         # The last input of the encoder is also
+#         # the first input of the decoder
+#         dec_inputs = source_seq[:, -1:, :]
+        
+#         # Generates as many outputs as the target length
+#         for i in range(self.target_len):
+#             # Output of decoder is N, 1, F
+#             out = self.decoder(dec_inputs)
+#             self.store_output(i, out)
+            
+#             prob = self.teacher_forcing_prob
+#             # In evaluation/test the target sequence is
+#             # unknown, so we cannot use teacher forcing
+#             if not self.training:
+#                 prob = 0
+                
+#             # If it is teacher forcing
+#             if torch.rand(1) <= prob:
+#                 # Takes the actual element
+#                 dec_inputs = target_seq[:, i:i+1, :]
+#             else:
+#                 # Otherwise uses the last predicted output
+#                 dec_inputs = out
+            
+#         return self.outputs
+
+# Single head attention
 # class Attention(nn.Module):
 #     def __init__(self, hidden_dim, input_dim=None, proj_values=False):
 #         super().__init__()
@@ -485,112 +751,3 @@ class ViT(nn.Module):
 #         att2 = self.cross_attn_heads(att1, source_mask)
 #         out = self.ffn(att2)
 #         return out
-
-# class EncoderDecoderSelfAttn(nn.Module):
-#     def __init__(self, encoder, decoder, input_len, target_len):
-#         super().__init__()
-#         self.encoder = encoder
-#         self.decoder = decoder
-#         self.input_len = input_len
-#         self.target_len = target_len
-#         self.trg_masks = self.subsequent_mask(self.target_len)
-        
-#     @staticmethod
-#     def subsequent_mask(size):
-#         attn_shape = (1, size, size)
-#         subsequent_mask = (1 - torch.triu(torch.ones(attn_shape), diagonal=1))
-#         return subsequent_mask
-                
-#     def encode(self, source_seq, source_mask):
-#         # Encodes the source sequence and uses the result
-#         # to initialize the decoder
-#         encoder_states = self.encoder(source_seq, source_mask)
-#         self.decoder.init_keys(encoder_states)
-        
-#     def decode(self, shifted_target_seq, source_mask=None, target_mask=None):
-#         # Decodes/generates a sequence using the shifted (masked)
-#         # target sequence - used in TRAIN mode
-#         outputs = self.decoder(shifted_target_seq, 
-#                                source_mask=source_mask,
-#                                target_mask=target_mask)
-#         return outputs
-    
-#     def predict(self, source_seq, source_mask):
-#         # Decodes/generates a sequence using one input
-#         # at a time - used in EVAL mode
-#         inputs = source_seq[:, -1:]
-#         for i in range(self.target_len):
-#             out = self.decode(inputs, source_mask, self.trg_masks[:, :i+1, :i+1])
-#             out = torch.cat([inputs, out[:, -1:, :]], dim=-2)
-#             inputs = out.detach()
-#         outputs = inputs[:, 1:, :]
-#         return outputs
-                
-#     def forward(self, X, source_mask=None):
-#         # Sends the mask to the same device as the inputs
-#         self.trg_masks = self.trg_masks.type_as(X).bool()
-#         # Slices the input to get source sequence
-#         source_seq = X[:, :self.input_len, :]
-#         # Encodes source sequence AND initializes decoder
-#         self.encode(source_seq, source_mask)
-#         if self.training:
-#             # Slices the input to get the shifted target seq
-#             shifted_target_seq = X[:, self.input_len-1:-1, :]
-#             # Decodes using the mask to prevent cheating
-#             outputs = self.decode(shifted_target_seq, source_mask, self.trg_masks)
-#         else:
-#             # Decodes using its own predictions
-#             outputs = self.predict(source_seq, source_mask)
-            
-#         return outputs
-
-# class EncoderPe(nn.Module):
-#     def __init__(self, n_heads, d_model, ff_units, n_features=None, max_len=100):
-#         super().__init__()
-#         pe_dim = d_model if n_features is None else n_features
-#         self.pe = PositionalEncoding(max_len, pe_dim)
-#         self.layer = EncoderSelfAttn(n_heads, d_model, ff_units, n_features)
-    
-#     def forward(self, query, mask=None):
-#         query_pe = self.pe(query)
-#         out = self.layer(query_pe, mask)
-#         return out
-    
-# class DecoderPe(nn.Module):
-#     def __init__(self, n_heads, d_model, ff_units, n_features=None, max_len=100):
-#         super().__init__()
-#         pe_dim = d_model if n_features is None else n_features
-#         self.pe = PositionalEncoding(max_len, pe_dim)
-#         self.layer = DecoderSelfAttn(n_heads, d_model, ff_units, n_features)
-        
-#     def init_keys(self, states):
-#         self.layer.init_keys(states)
-    
-#     def forward(self, query, source_mask=None, target_mask=None):
-#         query_pe = self.pe(query)
-#         out = self.layer(query_pe, source_mask, target_mask)
-#         return out
-
-# class EncoderDecoderTransf(EncoderDecoderSelfAttn):
-#     def __init__(self, encoder, decoder, input_len, target_len, n_features):
-#         super(EncoderDecoderTransf, self).__init__(encoder, decoder, input_len, target_len)
-#         self.n_features = n_features
-#         self.proj = nn.Linear(n_features, encoder.d_model)
-#         self.linear = nn.Linear(encoder.d_model, n_features)
-            
-#     def encode(self, source_seq, source_mask=None):
-#         # Projection
-#         source_proj = self.proj(source_seq)
-#         encoder_states = self.encoder(source_proj, source_mask)
-#         self.decoder.init_keys(encoder_states)    
-        
-#     def decode(self, shifted_target_seq, source_mask=None, target_mask=None):
-#         # Projection
-#         target_proj = self.proj(shifted_target_seq)
-#         outputs = self.decoder(target_proj,
-#                                source_mask=source_mask,
-#                                target_mask=target_mask)
-#         # Linear
-#         outputs = self.linear(outputs)
-#         return outputs
-    
