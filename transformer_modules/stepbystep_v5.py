@@ -7,7 +7,7 @@ import random
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.transforms import Normalize
+#from torchvision.transforms import Normalize
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
